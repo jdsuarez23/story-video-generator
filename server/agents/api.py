@@ -364,32 +364,48 @@ async def runway_generate_video(prompt: str, project_id: int, scene_num: int, du
         return None
 
 def _create_local_video(text: str, filepath: str, duration: int = 5):
-    """Genera un video local simple usando imageio y Pillow (fallback gratuito)."""
+    """Genera un video local simple usando imageio y Pillow.
+    Ahora usa pollinations.ai para obtener una imagen generada por IA gratis.
+    """
     try:
         import imageio
         from PIL import Image, ImageDraw
         import numpy as np
-        import math
+        import urllib.request
+        import urllib.parse
+        import os
+
+        # Intentar obtener imagen de pollinations.ai
+        # Usamos los primeros 50 caracteres del prompt para no romper la URL
+        safe_prompt = urllib.parse.quote(text[:100])
+        image_url = f"https://image.pollinations.ai/prompt/{safe_prompt}?width=1280&height=720&nologo=true"
+        
+        try:
+            req = urllib.request.Request(image_url, headers={'User-Agent': 'Mozilla/5.0'})
+            with urllib.request.urlopen(req, timeout=10) as response:
+                bg_img = Image.open(response).convert('RGB')
+        except Exception as e:
+            print(f"⚠️ Fallo al obtener imagen de pollinations: {e}")
+            bg_img = Image.new('RGB', (1280, 720), color=(30, 30, 40))
 
         fps = 24
         frames = duration * fps
         writer = imageio.get_writer(filepath, fps=fps, macro_block_size=1)
 
         for i in range(frames):
-            # Crear un fondo de color que cambia ligeramente
-            r = int(20 + (math.sin(i * 0.1) * 10))
-            g = int(20 + (math.cos(i * 0.1) * 10))
-            b = int(30 + (i / frames) * 20)
-            
-            img = Image.new('RGB', (1280, 720), color=(r, g, b))
+            # Clonar la imagen base para este frame
+            img = bg_img.copy()
             draw = ImageDraw.Draw(img)
             
-            # Dibujar texto
-            display_text = text[:80] + "..." if len(text) > 80 else text
-            draw.text((100, 300), display_text, fill=(255, 255, 255))
-            draw.text((100, 360), f"Generado localmente - Escena {text[:10]}", fill=(200, 200, 200))
-            draw.text((100, 420), f"Frame: {i+1}/{frames}", fill=(150, 150, 150))
+            # Oscurecer ligeramente un cuadro para el texto
+            draw.rectangle([(50, 600), (1230, 700)], fill=(0, 0, 0, 150))
             
+            # Dibujar texto (subtítulos)
+            display_text = text[:100] + "..." if len(text) > 100 else text
+            draw.text((70, 620), display_text, fill=(255, 255, 255))
+            draw.text((70, 660), f"Fallback Gratuito - Escena de {duration}s - Frame: {i+1}/{frames}", fill=(200, 200, 200))
+            
+            # Animar ligeramente la imagen (simular paneo/zoom leve si se desea, pero mantenerlo simple por velocidad)
             writer.append_data(np.array(img))
             
         writer.close()
@@ -453,9 +469,8 @@ async def generate_video_clip(prompt: str, project_id: int, scene_num: int, dura
     filename = f"p{project_id}_scene{scene_num}_video.mp4"
     filepath = str(GENERATED_DIR / filename)
     
-    # Reducimos a 3 segundos para que genere rápido
-    import math
-    res = await asyncio.to_thread(_create_local_video, prompt, filepath, min(duration_sec, 3))
+    # Generamos de la duración exacta solicitada
+    res = await asyncio.to_thread(_create_local_video, prompt, filepath, duration_sec)
     if res == "OK":
         _add_log(project_id, f"Video local escena {scene_num}: OK ✅ ({filename})")
         return f"/api/python/files/{filename}"
@@ -593,7 +608,7 @@ async def run_pipeline(
                 clip_url = await generate_video_clip(
                     scene.get("video_prompt", scene.get("description", "")),
                     project_id, i + 1,
-                    min(clip_duration, 10),
+                    clip_duration,
                 )
                 video_files.append({
                     "scene": i + 1, "url": clip_url,
