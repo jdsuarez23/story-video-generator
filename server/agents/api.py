@@ -398,6 +398,39 @@ def _create_local_video(text: str, filepath: str, duration: int = 5):
         print(f"❌ Local video error: {e}")
         return str(e)
 
+def _merge_video_audio(video_path: str, audio_path: str, output_path: str) -> bool:
+    """Usa ffmpeg (vía imageio_ffmpeg) para unir un video y un audio."""
+    try:
+        import imageio_ffmpeg
+        import subprocess
+        import os
+
+        if not os.path.exists(video_path) or not os.path.exists(audio_path):
+            return False
+
+        ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+        
+        cmd = [
+            ffmpeg_exe,
+            "-y", # Sobrescribir
+            "-i", video_path,
+            "-i", audio_path,
+            "-c:v", "copy",
+            "-c:a", "aac",
+            "-shortest",
+            output_path
+        ]
+        
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode == 0:
+            return True
+        else:
+            print(f"❌ FFmpeg merge error: {result.stderr}")
+            return False
+    except Exception as e:
+        print(f"❌ FFmpeg exception: {e}")
+        return False
+
 async def generate_video_clip(prompt: str, project_id: int, scene_num: int, duration_sec: int = 5) -> Optional[str]:
     """Intenta Runway ML primero, luego Kling AI, luego fallback local."""
     # Intento 1: Runway ML
@@ -575,20 +608,43 @@ async def run_pipeline(
         _complete_stage(project_id, "video")
 
         # ── Etapa 6: Ensamblaje ────────────────────────────────────────────
-        _set_stage(project_id, "assembly", 90, "Ensamblando resultado final...")
-        await asyncio.sleep(1)
-        _complete_stage(project_id, "assembly")
+        _set_stage(project_id, "assembly", 90, "Ensamblando audios y videos...")
+        
+        clips_generated = []
+        for i in range(num_clips):
+            scene_info = scenes[i] if i < len(scenes) else {}
+            v_url = video_files[i]["url"] if i < len(video_files) else None
+            a_url = audio_files[i]["url"] if i < len(audio_files) else None
+            
+            combined_url = v_url
+            if v_url and a_url:
+                try:
+                    _add_log(project_id, f"Ensamblaje: uniendo audio y video escena {i+1}...")
+                    
+                    v_filename = v_url.split("/")[-1]
+                    a_filename = a_url.split("/")[-1]
+                    v_local = str(GENERATED_DIR / v_filename)
+                    a_local = str(GENERATED_DIR / a_filename)
+                    out_filename = f"p{project_id}_scene{i+1}_combined.mp4"
+                    out_local = str(GENERATED_DIR / out_filename)
+                    
+                    ok = await asyncio.to_thread(_merge_video_audio, v_local, a_local, out_local)
+                    if ok:
+                        combined_url = f"/api/python/files/{out_filename}"
+                        _add_log(project_id, f"Ensamblaje escena {i+1}: OK ✅")
+                    else:
+                        _add_log(project_id, f"Ensamblaje escena {i+1}: Falló, dejando video sin audio")
+                except Exception as e:
+                    _add_log(project_id, f"Ensamblaje error: {str(e)[:80]}")
 
-        # ── Resultado final ────────────────────────────────────────────────
-        clips_generated = [
-            {
+            clips_generated.append({
                 "scene": i + 1,
-                "title": scenes[i].get("title", f"Escena {i+1}") if i < len(scenes) else f"Escena {i+1}",
-                "video_url": video_files[i]["url"] if i < len(video_files) else None,
-                "audio_url": audio_files[i]["url"] if i < len(audio_files) else None,
-            }
-            for i in range(num_clips)
-        ]
+                "title": scene_info.get("title", f"Escena {i+1}"),
+                "video_url": combined_url,
+                "audio_url": a_url,
+            })
+
+        _complete_stage(project_id, "assembly")
 
         pipeline_status[project_id].update({
             "status": "completed",
