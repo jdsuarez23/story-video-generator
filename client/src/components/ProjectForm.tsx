@@ -117,49 +117,95 @@ export const ProjectForm: React.FC<ProjectFormProps> = ({ onSubmit, isLoading = 
             </div>
 
             {/* Configuration Grid */}
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+            <div className="space-y-6">
               {/* Number of Clips */}
-              <div className="space-y-2">
-                <Label htmlFor="numClips" className="text-foreground font-semibold">
-                  Número de Clips
-                </Label>
-                <div className="flex items-center gap-4">
+              <div className="space-y-3">
+                <div className="flex items-center justify-between">
+                  <Label className="text-foreground font-semibold">Número de Clips</Label>
+                  <span className="text-primary font-bold text-lg">{numClips} clips</span>
+                </div>
+                {/* Quick presets */}
+                <div className="flex flex-wrap gap-2">
+                  {[1, 3, 5, 10, 15, 20].map((n) => (
+                    <button
+                      key={n}
+                      type="button"
+                      onClick={() => setNumClips(n)}
+                      disabled={isSubmitting || isLoading}
+                      className={`px-4 py-2 rounded-lg text-sm font-bold border transition-all ${
+                        numClips === n
+                          ? 'bg-primary text-primary-foreground border-primary shadow-lg shadow-primary/30'
+                          : 'bg-muted/10 text-muted-foreground border-border/40 hover:border-primary/50 hover:text-primary'
+                      }`}
+                    >
+                      {n}
+                    </button>
+                  ))}
                   <Input
-                    id="numClips"
                     type="number"
                     min="1"
                     max="20"
                     value={numClips}
-                    onChange={(e) => setNumClips(Math.max(1, parseInt(e.target.value) || 1))}
-                    className="input-neon"
+                    onChange={(e) => setNumClips(Math.min(20, Math.max(1, parseInt(e.target.value) || 1)))}
+                    className="input-neon w-20 text-center"
                     disabled={isSubmitting || isLoading}
+                    placeholder="Custom"
                   />
-                  <span className="text-sm text-muted-foreground whitespace-nowrap">
-                    {numClips} escenas
-                  </span>
                 </div>
               </div>
 
               {/* Clip Duration */}
-              <div className="space-y-2">
-                <Label htmlFor="clipDuration" className="text-foreground font-semibold">
-                  Duración por Clip (segundos)
-                </Label>
-                <div className="flex items-center gap-4">
-                  <Input
-                    id="clipDuration"
-                    type="number"
-                    min="10"
-                    max="120"
-                    step="10"
-                    value={clipDuration}
-                    onChange={(e) => setClipDuration(Math.max(10, parseInt(e.target.value) || 10))}
-                    className="input-neon"
-                    disabled={isSubmitting || isLoading}
-                  />
-                  <span className="text-sm text-muted-foreground whitespace-nowrap">
-                    {Math.round(clipDuration / 60)}:{String(clipDuration % 60).padStart(2, '0')}
+              <div className="space-y-3">
+                <div className="flex items-center justify-between">
+                  <Label className="text-foreground font-semibold">Duración por Escena</Label>
+                  <span className="text-primary font-bold text-lg">
+                    {clipDuration >= 60
+                      ? `${Math.floor(clipDuration / 60)}:${String(clipDuration % 60).padStart(2, '0')} min`
+                      : `${clipDuration}s`}
                   </span>
+                </div>
+                {/* Quick presets */}
+                <div className="flex flex-wrap gap-2">
+                  {[15, 30, 60, 90, 120].map((d) => (
+                    <button
+                      key={d}
+                      type="button"
+                      onClick={() => setClipDuration(d)}
+                      disabled={isSubmitting || isLoading}
+                      className={`px-4 py-2 rounded-lg text-sm font-bold border transition-all ${
+                        clipDuration === d
+                          ? 'bg-secondary text-secondary-foreground border-secondary shadow-lg shadow-secondary/30'
+                          : 'bg-muted/10 text-muted-foreground border-border/40 hover:border-secondary/50 hover:text-secondary'
+                      }`}
+                    >
+                      {d >= 60 ? `${d / 60}min` : `${d}s`}
+                    </button>
+                  ))}
+                </div>
+                <input
+                  type="range"
+                  min="10"
+                  max="120"
+                  step="5"
+                  value={clipDuration}
+                  onChange={(e) => setClipDuration(parseInt(e.target.value))}
+                  disabled={isSubmitting || isLoading}
+                  className="w-full accent-secondary cursor-pointer"
+                />
+              </div>
+
+              {/* Total duration summary */}
+              <div className="p-4 rounded-lg bg-muted/10 border border-border/30 flex items-center justify-between">
+                <div className="text-sm text-muted-foreground space-y-0.5">
+                  <p className="font-semibold text-foreground">Resumen del proyecto</p>
+                  <p>{numClips} clips × {clipDuration}s = <span className="text-primary font-bold">
+                    {Math.floor((numClips * clipDuration) / 60)}:{String((numClips * clipDuration) % 60).padStart(2, '0')} min total
+                  </span></p>
+                  <p className="text-xs">Video generado: ~{numClips * 10}s con Runway (10s/clip)</p>
+                </div>
+                <div className="text-right text-xs text-muted-foreground">
+                  <p className="text-secondary font-bold text-lg">{numClips}</p>
+                  <p>escenas</p>
                 </div>
               </div>
             </div>

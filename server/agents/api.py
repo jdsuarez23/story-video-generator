@@ -1,7 +1,14 @@
 """
 API FastAPI - Pipeline Real de Generación de Video
-Integra: ElevenLabs (voz), Kling AI (video), OpenAI/LangChain (guion)
+Integra: ElevenLabs (voz), Runway ML / Kling AI (video), OpenAI/LangChain (guion)
 """
+import sys
+# Forzar UTF-8 en Windows para evitar UnicodeEncodeError con emojis
+if hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+if hasattr(sys.stderr, 'reconfigure'):
+    sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
@@ -23,6 +30,9 @@ ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY", "")
 KLING_API_KEY      = os.getenv("KLING_API_KEY", "")
 KLING_API_SECRET   = os.getenv("KLING_API_SECRET", "")
 KLING_BASE_URL     = "https://api.klingai.com"
+RUNWAY_API_KEY     = os.getenv("RUNWAY_API_KEY", "")
+RUNWAY_BASE_URL    = "https://api.dev.runwayml.com/v1"
+RUNWAY_MODEL       = "gen4.5"   # gen4.5 | gen3a_turbo | veo3.1_fast
 OPENAI_API_KEY     = os.getenv("OPENAI_API_KEY", "")
 
 # Directorio para archivos generados (audios locales)
@@ -272,6 +282,156 @@ async def kling_generate_video(prompt: str, project_id: int, scene_num: int, dur
         print(f"❌ Kling excepción: {e}")
         return None
 
+# ── Runway ML ──────────────────────────────────────────────────────────────────
+async def runway_generate_video(prompt: str, project_id: int, scene_num: int, duration_sec: int = 5) -> Optional[str]:
+    """Genera un clip de video con Runway ML Gen-4.5 y retorna la URL."""
+    if not RUNWAY_API_KEY:
+        return None
+
+    # Runway max: 5 o 10 segundos
+    duration = 10 if duration_sec >= 10 else 5
+    headers = {
+        "Authorization": f"Bearer {RUNWAY_API_KEY}",
+        "X-Runway-Version": "2024-11-06",
+        "Content-Type": "application/json",
+    }
+
+    try:
+        # Paso 1: Crear tarea de generación
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            r = await client.post(
+                f"{RUNWAY_BASE_URL}/text_to_video",
+                headers=headers,
+                json={
+                    "promptText": prompt[:2000],
+                    "model": RUNWAY_MODEL,
+                    "ratio": "1280:720",
+                    "duration": duration,
+                },
+            )
+
+        if r.status_code not in (200, 201):
+            err = r.text[:200]
+            print(f"❌ Runway create {r.status_code}: {err}")
+            _add_log(project_id, f"Runway error {r.status_code}: {err[:100]}")
+            return None
+
+        task_id = r.json().get("id") or r.json().get("taskId")
+        if not task_id:
+            _add_log(project_id, f"Runway: sin task_id en respuesta")
+            return None
+
+        _add_log(project_id, f"Runway escena {scene_num}: task {task_id[:16]}... polling")
+
+        # Paso 2: Polling hasta 8 minutos
+        for attempt in range(96):  # 96 × 5s = 8 min
+            await asyncio.sleep(5)
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                sr = await client.get(
+                    f"{RUNWAY_BASE_URL}/tasks/{task_id}",
+                    headers=headers,
+                )
+            if sr.status_code != 200:
+                continue
+
+            task = sr.json()
+            status = task.get("status", "")
+
+            if status == "SUCCEEDED":
+                outputs = task.get("output", [])
+                if outputs:
+                    url = outputs[0]
+                    print(f"✅ Runway escena {scene_num}: {url}")
+                    _add_log(project_id, f"Runway escena {scene_num}: OK ✅")
+                    return url
+                return None
+
+            if status == "FAILED":
+                err = task.get("failure", "") or task.get("failureCode", "")
+                print(f"❌ Runway task failed: {err}")
+                _add_log(project_id, f"Runway escena {scene_num} fallo: {str(err)[:80]}")
+                return None
+
+            if attempt % 6 == 0:  # log cada 30s
+                _add_log(project_id, f"Runway escena {scene_num}: {status} (intento {attempt+1})")
+
+        _add_log(project_id, f"Runway escena {scene_num}: timeout")
+        return None
+
+    except Exception as e:
+        print(f"❌ Runway excepción: {e}")
+        _add_log(project_id, f"Runway excepción: {str(e)[:80]}")
+        return None
+
+def _create_local_video(text: str, filepath: str, duration: int = 5):
+    """Genera un video local simple usando imageio y Pillow (fallback gratuito)."""
+    try:
+        import imageio
+        from PIL import Image, ImageDraw
+        import numpy as np
+        import math
+
+        fps = 24
+        frames = duration * fps
+        writer = imageio.get_writer(filepath, fps=fps, macro_block_size=1)
+
+        for i in range(frames):
+            # Crear un fondo de color que cambia ligeramente
+            r = int(20 + (math.sin(i * 0.1) * 10))
+            g = int(20 + (math.cos(i * 0.1) * 10))
+            b = int(30 + (i / frames) * 20)
+            
+            img = Image.new('RGB', (1280, 720), color=(r, g, b))
+            draw = ImageDraw.Draw(img)
+            
+            # Dibujar texto
+            display_text = text[:80] + "..." if len(text) > 80 else text
+            draw.text((100, 300), display_text, fill=(255, 255, 255))
+            draw.text((100, 360), f"Generado localmente - Escena {text[:10]}", fill=(200, 200, 200))
+            draw.text((100, 420), f"Frame: {i+1}/{frames}", fill=(150, 150, 150))
+            
+            writer.append_data(np.array(img))
+            
+        writer.close()
+        return "OK"
+    except Exception as e:
+        print(f"❌ Local video error: {e}")
+        return str(e)
+
+async def generate_video_clip(prompt: str, project_id: int, scene_num: int, duration_sec: int = 5) -> Optional[str]:
+    """Intenta Runway ML primero, luego Kling AI, luego fallback local."""
+    # Intento 1: Runway ML
+    if RUNWAY_API_KEY:
+        _add_log(project_id, f"Video escena {scene_num}: probando Runway {RUNWAY_MODEL}...")
+        url = await runway_generate_video(prompt, project_id, scene_num, duration_sec)
+        if url:
+            return url
+        _add_log(project_id, f"Video escena {scene_num}: Runway falló, probando Kling...")
+
+    # Intento 2: Kling AI
+    if KLING_API_KEY and KLING_API_SECRET:
+        url = await kling_generate_video(prompt, project_id, scene_num, duration_sec)
+        if url:
+            return url
+        _add_log(project_id, f"Video escena {scene_num}: Kling falló, probando generador local...")
+
+    # Intento 3: Fallback Local Gratuito (imageio)
+    _add_log(project_id, f"Video escena {scene_num}: generando video local (fallback gratuito)...")
+    filename = f"p{project_id}_scene{scene_num}_video.mp4"
+    filepath = str(GENERATED_DIR / filename)
+    
+    # Reducimos a 3 segundos para que genere rápido
+    import math
+    res = await asyncio.to_thread(_create_local_video, prompt, filepath, min(duration_sec, 3))
+    if res == "OK":
+        _add_log(project_id, f"Video local escena {scene_num}: OK ✅ ({filename})")
+        return f"/api/python/files/{filename}"
+
+    _add_log(project_id, f"Video escena {scene_num} fallback error: {str(res)[:80]}")
+    _add_log(project_id, f"Video escena {scene_num}: todos los proveedores fallaron")
+    return None
+
+
 # ── Generador de historia mock ───────────────────────────────────────────────
 def _mock_story(user_idea: str, num_clips: int, clip_duration: int) -> dict:
     scenes = []
@@ -385,33 +545,31 @@ async def run_pipeline(
         pipeline_status[project_id]["audio_files"] = audio_files
         _complete_stage(project_id, "narration")
 
-        # ── Etapa 5: Video (Kling AI) ──────────────────────────────────────
-        _set_stage(project_id, "video", 62, "Generando clips de video con Kling AI...")
+        # ── Etapa 5: Video (Runway ML → Kling fallback) ────────────────────
+        provider = "Runway ML" if RUNWAY_API_KEY else "Kling AI"
+        _set_stage(project_id, "video", 62, f"Generando clips de video con {provider}...")
 
         video_files = []
-        if KLING_API_KEY and KLING_API_SECRET:
+        if RUNWAY_API_KEY or (KLING_API_KEY and KLING_API_SECRET):
             for i, scene in enumerate(scenes):
                 _set_stage(
                     project_id, "video",
                     62 + int((i / max(len(scenes), 1)) * 25),
-                    f"Kling AI: generando clip {i+1}/{len(scenes)}..."
+                    f"{provider}: generando clip {i+1}/{len(scenes)}..."
                 )
-                _add_log(project_id, f"Kling AI: iniciando clip {i+1}/{len(scenes)}")
-                video_url = await kling_generate_video(
+                clip_url = await generate_video_clip(
                     scene.get("video_prompt", scene.get("description", "")),
                     project_id, i + 1,
                     min(clip_duration, 10),
                 )
-                status_msg = video_url if video_url else "FALLO"
-                _add_log(project_id, f"Kling escena {i+1}: {status_msg[:80]}")
                 video_files.append({
-                    "scene": i + 1, "url": video_url,
+                    "scene": i + 1, "url": clip_url,
                     "title": scene.get("title", f"Escena {i+1}"),
                     "prompt": scene.get("video_prompt", "")[:100],
                 })
         else:
-            await asyncio.sleep(2)
-            _add_log(project_id, "Kling AI: no configurado — omitido")
+            await asyncio.sleep(1)
+            _add_log(project_id, "Video: sin proveedor configurado (Runway/Kling)")
 
         pipeline_status[project_id]["video_files"] = video_files
         _complete_stage(project_id, "video")
@@ -465,9 +623,11 @@ async def root():
         "version": "2.0.0",
         "apis": {
             "elevenlabs": bool(ELEVENLABS_API_KEY),
+            "runway": bool(RUNWAY_API_KEY),
             "kling_ai": bool(KLING_API_KEY and KLING_API_SECRET),
             "openai": bool(llm),
         },
+        "video_provider": "Runway ML" if RUNWAY_API_KEY else ("Kling AI" if KLING_API_KEY else "none"),
     }
 
 @app.get("/health")
@@ -475,6 +635,8 @@ async def health():
     return {
         "status": "ok",
         "elevenlabs": bool(ELEVENLABS_API_KEY),
+        "runway": bool(RUNWAY_API_KEY),
+        "runway_model": RUNWAY_MODEL if RUNWAY_API_KEY else None,
         "kling": bool(KLING_API_KEY and KLING_API_SECRET),
         "llm": bool(llm),
     }

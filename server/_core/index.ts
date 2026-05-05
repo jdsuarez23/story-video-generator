@@ -52,8 +52,18 @@ async function startServer() {
         init.body = JSON.stringify(req.body);
       }
       const pyRes = await fetch(pythonUrl, init);
-      const data = await pyRes.json();
-      res.status(pyRes.status).json(data);
+      const contentType = pyRes.headers.get("content-type") || "";
+      
+      if (contentType.includes("application/json")) {
+        const data = await pyRes.json();
+        res.status(pyRes.status).json(data);
+      } else {
+        // Forward binary files (audio, video, etc) directly
+        res.status(pyRes.status);
+        res.setHeader("Content-Type", contentType);
+        const arrayBuffer = await pyRes.arrayBuffer();
+        res.send(Buffer.from(arrayBuffer));
+      }
     } catch (err) {
       console.error("[Python Proxy] Error:", err);
       res.status(503).json({
