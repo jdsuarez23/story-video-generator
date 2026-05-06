@@ -533,44 +533,52 @@ async def kinovi_generate_video(prompt: str, project_id: int, scene_num: int, du
         print(f"❌ Kinovi excepción: {e}")
         return None
 
-def _wan_generate_video(prompt: str, filepath: str, duration: int = 5):
+def _modelscope_generate_video(prompt: str, filepath: str, duration: int = 5):
     """
-    Genera video localmente usando Wan2.1-T2V-1.3B y CPU Offloading.
+    Genera video localmente usando damo-vilab/text-to-video-ms-1.7b (ModelScope).
+    Es un modelo clásico, requiere muchísima menos RAM/VRAM.
     """
     try:
         import torch
-        from diffusers import WanPipeline
+        from diffusers import DiffusionPipeline, DPMSolverMultistepScheduler
         from diffusers.utils import export_to_video
         import os
         import gc
         
-        # Wan2.1 normalmente procesa a 8 fps
-        num_frames = (duration * 8) + 1
-        model_id = "Wan-AI/Wan2.1-T2V-1.3B-Diffusers"
+        # ModelScope por defecto entrena con secuencias cortas.
+        # Maximizaremos a 32 frames (unos 4 segundos a 8fps) para evitar OOM absoluto.
+        num_frames = min((duration * 8) + 1, 32)
+        model_id = "damo-vilab/text-to-video-ms-1.7b"
         
-        print(f"🧠 Cargando modelo Wan2.1 (puede tardar la primera vez)...")
-        pipe = WanPipeline.from_pretrained(
+        print(f"🧠 Cargando modelo ModelScope 1.7B (ligero)...")
+        pipe = DiffusionPipeline.from_pretrained(
             model_id, 
-            torch_dtype=torch.float16
+            torch_dtype=torch.float16,
+            variant="fp16"
         )
         
-        # REGLA DE ORO PARA 4GB VRAM
-        pipe.enable_sequential_cpu_offload()
+        # Optimizador de pasos para hacerlo más rápido
+        pipe.scheduler = DPMSolverMultistepScheduler.from_config(pipe.scheduler.config)
         
-        print(f"🎬 Iniciando generación de video WAN ({num_frames} frames)... esto tomará mucho tiempo.")
+        # REGLA PARA 4GB VRAM (Mucho más rápida que la de WAN)
+        pipe.enable_model_cpu_offload()
+        # Reducir el consumo de memoria en la atención (VRAM saver)
+        pipe.enable_attention_slicing()
+        
+        print(f"🎬 Generando video ModelScope ({num_frames} frames)... esto tomará un par de minutos.")
         
         output = pipe(
             prompt,
             num_frames=num_frames,
-            width=480,          # Resolución moderada
-            height=832, 
-            num_inference_steps=20, 
-            guidance_scale=7.0
+            height=256,         # Resolución pequeña para 4GB VRAM
+            width=256, 
+            num_inference_steps=25, 
+            guidance_scale=7.5
         ).frames[0]
         
         export_to_video(output, filepath, fps=8)
         
-        # Limpieza intensiva
+        # Limpieza
         del pipe
         torch.cuda.empty_cache()
         gc.collect()
@@ -578,11 +586,11 @@ def _wan_generate_video(prompt: str, filepath: str, duration: int = 5):
         return "OK"
     except Exception as e:
         import traceback
-        print(f"❌ WAN video error: {traceback.format_exc()}")
+        print(f"❌ ModelScope video error: {traceback.format_exc()}")
         return str(e)
 
 async def generate_video_clip(prompt: str, project_id: int, scene_num: int, duration_sec: int = 5) -> Optional[str]:
-    """Intenta Kinovi AI primero, luego Runway ML, luego Kling AI, luego WAN local, luego fallback imagen."""
+    """Intenta Kinovi AI primero, luego Runway ML, luego Kling AI, luego ModelScope local, luego fallback imagen."""
     
     # Intento 0: Kinovi AI (Seedance-20)
     if KINOVI_API_KEY:
@@ -610,14 +618,14 @@ async def generate_video_clip(prompt: str, project_id: int, scene_num: int, dura
     filename = f"p{project_id}_scene{scene_num}_video.mp4"
     filepath = str(GENERATED_DIR / filename)
 
-    # Intento 3: Súper Generador Local (WAN 2.1)
-    _add_log(project_id, f"Video escena {scene_num}: iniciando modelo WAN local pesado...")
-    wan_res = await asyncio.to_thread(_wan_generate_video, prompt, filepath, duration_sec)
-    if wan_res == "OK":
-        _add_log(project_id, f"Video local WAN escena {scene_num}: OK ✅ ({filename})")
+    # Intento 3: Generador Local Ligero (ModelScope)
+    _add_log(project_id, f"Video escena {scene_num}: iniciando modelo ModelScope local...")
+    ms_res = await asyncio.to_thread(_modelscope_generate_video, prompt, filepath, duration_sec)
+    if ms_res == "OK":
+        _add_log(project_id, f"Video local ModelScope escena {scene_num}: OK ✅ ({filename})")
         return f"/api/python/files/{filename}"
     else:
-        _add_log(project_id, f"Video WAN falló, pasando a imagen estática...")
+        _add_log(project_id, f"Video ModelScope falló, pasando a imagen estática...")
 
     # Intento 4: Fallback Local Gratuito (Pollinations imagen estática)
     _add_log(project_id, f"Video escena {scene_num}: generando video estático de seguridad...")
@@ -720,55 +728,44 @@ async def run_pipeline(
         await asyncio.sleep(1)
         _complete_stage(project_id, "storyboard")
 
-        # ── Etapa 4: Narración (ElevenLabs) ──────────────────────────────
-        _set_stage(project_id, "narration", 45, "Generando narración con ElevenLabs...")
+        # ── Etapa 4: Narración (ElevenLabs / Fallback) ──────────────────────────────
+        _set_stage(project_id, "narration", 45, "Generando narración...")
 
         audio_files = []
-        if ELEVENLABS_API_KEY:
-            for i, scene in enumerate(scenes):
-                narr_text = scene.get("dialogue") or scene.get("description", "")
-                _set_stage(
-                    project_id, "narration",
-                    45 + int((i / max(len(scenes), 1)) * 15),
-                    f"ElevenLabs: narración escena {i+1}/{len(scenes)}..."
-                )
-                _add_log(project_id, f"ElevenLabs: iniciando escena {i+1}/{len(scenes)}")
-                audio_url = await elevenlabs_tts(narr_text, project_id, i + 1)
-                status_msg = "OK" if audio_url else "FALLO"
-                _add_log(project_id, f"ElevenLabs escena {i+1}: {status_msg}")
-                audio_files.append({"scene": i + 1, "url": audio_url, "text": narr_text[:100]})
-        else:
-            await asyncio.sleep(1)
-            _add_log(project_id, "ElevenLabs: no configurado — omitido")
+        for i, scene in enumerate(scenes):
+            narr_text = scene.get("dialogue") or scene.get("description", "")
+            _set_stage(
+                project_id, "narration",
+                45 + int((i / max(len(scenes), 1)) * 15),
+                f"Narración escena {i+1}/{len(scenes)}..."
+            )
+            audio_url = await elevenlabs_tts(narr_text, project_id, i + 1)
+            audio_files.append({"scene": i + 1, "url": audio_url, "text": narr_text[:100]})
 
         pipeline_status[project_id]["audio_files"] = audio_files
         _complete_stage(project_id, "narration")
 
-        # ── Etapa 5: Video (Runway ML → Kling fallback) ────────────────────
-        provider = "Kinovi AI" if KINOVI_API_KEY else ("Runway ML" if RUNWAY_API_KEY else "Kling AI")
+        # ── Etapa 5: Video (Cloud → Local Fallback) ────────────────────
+        provider = "Kinovi AI" if KINOVI_API_KEY else ("Runway ML" if RUNWAY_API_KEY else ("Kling AI" if KLING_API_KEY else "Generador Local (ModelScope)"))
         _set_stage(project_id, "video", 62, f"Generando clips de video con {provider}...")
 
         video_files = []
-        if KINOVI_API_KEY or RUNWAY_API_KEY or (KLING_API_KEY and KLING_API_SECRET):
-            for i, scene in enumerate(scenes):
-                _set_stage(
-                    project_id, "video",
-                    62 + int((i / max(len(scenes), 1)) * 25),
-                    f"{provider}: generando clip {i+1}/{len(scenes)}..."
-                )
-                clip_url = await generate_video_clip(
-                    scene.get("video_prompt", scene.get("description", "")),
-                    project_id, i + 1,
-                    clip_duration,
-                )
-                video_files.append({
-                    "scene": i + 1, "url": clip_url,
-                    "title": scene.get("title", f"Escena {i+1}"),
-                    "prompt": scene.get("video_prompt", "")[:100],
-                })
-        else:
-            await asyncio.sleep(1)
-            _add_log(project_id, "Video: sin proveedor configurado (Runway/Kling)")
+        for i, scene in enumerate(scenes):
+            _set_stage(
+                project_id, "video",
+                62 + int((i / max(len(scenes), 1)) * 25),
+                f"{provider}: generando clip {i+1}/{len(scenes)}..."
+            )
+            clip_url = await generate_video_clip(
+                scene.get("video_prompt", scene.get("description", "")),
+                project_id, i + 1,
+                clip_duration,
+            )
+            video_files.append({
+                "scene": i + 1, "url": clip_url,
+                "title": scene.get("title", f"Escena {i+1}"),
+                "prompt": scene.get("video_prompt", "")[:100],
+            })
 
         pipeline_status[project_id]["video_files"] = video_files
         _complete_stage(project_id, "video")

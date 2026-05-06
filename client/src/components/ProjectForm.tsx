@@ -166,7 +166,7 @@ export const ProjectForm: React.FC<ProjectFormProps> = ({ onSubmit, isLoading = 
                 </div>
                 {/* Quick presets */}
                 <div className="flex flex-wrap gap-2">
-                  {[15, 30, 60, 90, 120].map((d) => (
+                  {[3, 5, 10, 15, 30, 60].map((d) => (
                     <button
                       key={d}
                       type="button"
@@ -181,12 +181,22 @@ export const ProjectForm: React.FC<ProjectFormProps> = ({ onSubmit, isLoading = 
                       {d >= 60 ? `${d / 60}min` : `${d}s`}
                     </button>
                   ))}
+                  <Input
+                    type="number"
+                    min="1"
+                    max="600"
+                    value={clipDuration}
+                    onChange={(e) => setClipDuration(Math.max(1, parseInt(e.target.value) || 1))}
+                    className="input-neon w-20 text-center"
+                    disabled={isSubmitting || isLoading}
+                    placeholder="Segs"
+                  />
                 </div>
                 <input
                   type="range"
-                  min="10"
+                  min="1"
                   max="120"
-                  step="5"
+                  step="1"
                   value={clipDuration}
                   onChange={(e) => setClipDuration(parseInt(e.target.value))}
                   disabled={isSubmitting || isLoading}
