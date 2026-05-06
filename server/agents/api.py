@@ -533,47 +533,46 @@ async def kinovi_generate_video(prompt: str, project_id: int, scene_num: int, du
         print(f"❌ Kinovi excepción: {e}")
         return None
 
-def _modelscope_generate_video(prompt: str, filepath: str, duration: int = 5):
+def _wan_generate_video(prompt: str, filepath: str, duration: int = 5):
     """
-    Genera video localmente usando damo-vilab/text-to-video-ms-1.7b (ModelScope).
-    Es un modelo clásico, requiere muchísima menos RAM/VRAM.
+    Genera video localmente usando Wan2.1-T2V-1.3B y CPU Offloading.
     """
     try:
         import torch
-        from diffusers import DiffusionPipeline, DPMSolverMultistepScheduler
+        from diffusers import WanPipeline
         from diffusers.utils import export_to_video
         import os
         import gc
         
-        # ModelScope por defecto entrena con secuencias cortas.
-        # Maximizaremos a 32 frames (unos 4 segundos a 8fps) para evitar OOM absoluto.
+        # Wan normalmente procesa a 8 fps
+        # Maximizaremos a 32 frames (4 segundos) para intentar evitar OOM en la VAE
         num_frames = min((duration * 8) + 1, 32)
-        model_id = "damo-vilab/text-to-video-ms-1.7b"
+        model_id = "Wan-AI/Wan2.1-T2V-1.3B-Diffusers"
         
-        print(f"🧠 Cargando modelo ModelScope 1.7B (ligero)...")
-        pipe = DiffusionPipeline.from_pretrained(
+        print(f"🧠 Cargando modelo WAN 2.1 (muy pesado)...")
+        pipe = WanPipeline.from_pretrained(
             model_id, 
-            torch_dtype=torch.float16,
-            variant="fp16"
+            torch_dtype=torch.float16
         )
         
-        # Optimizador de pasos para hacerlo más rápido
-        pipe.scheduler = DPMSolverMultistepScheduler.from_config(pipe.scheduler.config)
+        # REGLA PARA VRAM LIMITADA: Offload secuencial (pieza por pieza)
+        pipe.enable_sequential_cpu_offload()
+        # Cortar la atención en rebanadas para ahorrar VRAM durante la inferencia
+        if hasattr(pipe, "enable_attention_slicing"):
+            pipe.enable_attention_slicing()
+        # Activar el ahorro de memoria de la VAE si existe el método
+        if hasattr(pipe, "enable_vae_slicing"):
+            pipe.enable_vae_slicing()
         
-        # REGLA PARA 4GB VRAM (Mucho más rápida que la de WAN)
-        pipe.enable_model_cpu_offload()
-        # Reducir el consumo de memoria en la atención (VRAM saver)
-        pipe.enable_attention_slicing()
-        
-        print(f"🎬 Generando video ModelScope ({num_frames} frames)... esto tomará un par de minutos.")
+        print(f"🎬 Generando video WAN ({num_frames} frames)... prepárate para esperar bastante.")
         
         output = pipe(
             prompt,
             num_frames=num_frames,
-            height=256,         # Resolución pequeña para 4GB VRAM
-            width=256, 
-            num_inference_steps=25, 
-            guidance_scale=7.5
+            height=480,         # Resolución media
+            width=832, 
+            num_inference_steps=20, 
+            guidance_scale=7.0
         ).frames[0]
         
         export_to_video(output, filepath, fps=8)
@@ -586,11 +585,11 @@ def _modelscope_generate_video(prompt: str, filepath: str, duration: int = 5):
         return "OK"
     except Exception as e:
         import traceback
-        print(f"❌ ModelScope video error: {traceback.format_exc()}")
+        print(f"❌ WAN video error: {traceback.format_exc()}")
         return str(e)
 
 async def generate_video_clip(prompt: str, project_id: int, scene_num: int, duration_sec: int = 5) -> Optional[str]:
-    """Intenta Kinovi AI primero, luego Runway ML, luego Kling AI, luego ModelScope local, luego fallback imagen."""
+    """Intenta Kinovi AI primero, luego Runway ML, luego Kling AI, luego WAN local, luego fallback imagen."""
     
     # Intento 0: Kinovi AI (Seedance-20)
     if KINOVI_API_KEY:
@@ -618,14 +617,14 @@ async def generate_video_clip(prompt: str, project_id: int, scene_num: int, dura
     filename = f"p{project_id}_scene{scene_num}_video.mp4"
     filepath = str(GENERATED_DIR / filename)
 
-    # Intento 3: Generador Local Ligero (ModelScope)
-    _add_log(project_id, f"Video escena {scene_num}: iniciando modelo ModelScope local...")
-    ms_res = await asyncio.to_thread(_modelscope_generate_video, prompt, filepath, duration_sec)
+    # Intento 3: Generador Local Pesado (WAN 2.1)
+    _add_log(project_id, f"Video escena {scene_num}: iniciando modelo WAN local...")
+    ms_res = await asyncio.to_thread(_wan_generate_video, prompt, filepath, duration_sec)
     if ms_res == "OK":
-        _add_log(project_id, f"Video local ModelScope escena {scene_num}: OK ✅ ({filename})")
+        _add_log(project_id, f"Video local WAN escena {scene_num}: OK ✅ ({filename})")
         return f"/api/python/files/{filename}"
     else:
-        _add_log(project_id, f"Video ModelScope falló, pasando a imagen estática...")
+        _add_log(project_id, f"Video WAN falló, pasando a imagen estática...")
 
     # Intento 4: Fallback Local Gratuito (Pollinations imagen estática)
     _add_log(project_id, f"Video escena {scene_num}: generando video estático de seguridad...")
