@@ -447,8 +447,151 @@ def _merge_video_audio(video_path: str, audio_path: str, output_path: str) -> bo
         print(f"❌ FFmpeg exception: {e}")
         return False
 
+KINOVI_API_KEY = os.getenv("KINOVI_API_KEY")
+
+async def kinovi_generate_video(prompt: str, project_id: int, scene_num: int, duration_sec: int = 5) -> Optional[str]:
+    """Crea un clip de video con Kinovi AI (Seedance-20) y retorna la URL del video."""
+    if not KINOVI_API_KEY:
+        print("⚠️  Kinovi AI: credenciales no configuradas")
+        return None
+
+    # Kinovi usa duraciones fijas, enviaremos la que solicitó el usuario en formato string
+    duration_str = str(duration_sec)
+    
+    create_payload = {
+        "model": "seedance-20",
+        "inputs": {
+            "prompt": prompt[:2500],
+            "duration": duration_str,
+            "aspectRatio": "16:9"
+        }
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            r = await client.post(
+                "https://kinovi.ai/api/v1/jobs/createTask",
+                headers={"Authorization": f"Bearer {KINOVI_API_KEY}", "Content-Type": "application/json"},
+                json=create_payload,
+            )
+
+        if r.status_code != 200:
+            error_detail = r.text[:300]
+            print(f"\u274c Kinovi create error {r.status_code}: {error_detail}")
+            _add_log(project_id, f"Kinovi error {r.status_code}: {error_detail[:120]}")
+            return None
+
+        data = r.json()
+        task_id = data.get("taskId") or data.get("id")
+        if not task_id:
+            print(f"❌ Kinovi: no task_id en respuesta: {r.text[:200]}")
+            return None
+
+        print(f"🎬 Kinovi task_id={task_id} — polling...")
+
+        # Polling hasta 8 minutos
+        for attempt in range(96):  # 96 × 5s = 8 min
+            await asyncio.sleep(5)
+            
+            poll_url = f"https://kinovi.ai/api/v1/jobs/recordInfo?taskId={task_id}"
+            
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                sr = await client.get(
+                    poll_url,
+                    headers={"Authorization": f"Bearer {KINOVI_API_KEY}"},
+                )
+                
+            if sr.status_code != 200:
+                continue
+                    
+            status_data = sr.json()
+            task_status = status_data.get("status", "").lower()
+
+            if task_status in ["succeed", "completed", "success", "done"]:
+                # Kinovi retorna el output como una lista de diccionarios
+                outputs = status_data.get("output", [])
+                video_url = None
+                if outputs and isinstance(outputs, list):
+                    video_url = outputs[0].get("url")
+                
+                if video_url:
+                    print(f"✅ Kinovi escena {scene_num}: {video_url}")
+                    return video_url
+                return None
+
+            if task_status in ["failed", "error"]:
+                msg = status_data.get("error", "desconocido")
+                print(f"❌ Kinovi task failed: {msg}")
+                return None
+
+            print(f"  ⏳ Kinovi escena {scene_num} attempt {attempt+1}: {task_status}")
+
+        print(f"⏰ Kinovi timeout escena {scene_num}")
+        return None
+
+    except Exception as e:
+        print(f"❌ Kinovi excepción: {e}")
+        return None
+
+def _wan_generate_video(prompt: str, filepath: str, duration: int = 5):
+    """
+    Genera video localmente usando Wan2.1-T2V-1.3B y CPU Offloading.
+    """
+    try:
+        import torch
+        from diffusers import WanPipeline
+        from diffusers.utils import export_to_video
+        import os
+        import gc
+        
+        # Wan2.1 normalmente procesa a 8 fps
+        num_frames = (duration * 8) + 1
+        model_id = "Wan-AI/Wan2.1-T2V-1.3B-Diffusers"
+        
+        print(f"🧠 Cargando modelo Wan2.1 (puede tardar la primera vez)...")
+        pipe = WanPipeline.from_pretrained(
+            model_id, 
+            torch_dtype=torch.float16
+        )
+        
+        # REGLA DE ORO PARA 4GB VRAM
+        pipe.enable_sequential_cpu_offload()
+        
+        print(f"🎬 Iniciando generación de video WAN ({num_frames} frames)... esto tomará mucho tiempo.")
+        
+        output = pipe(
+            prompt,
+            num_frames=num_frames,
+            width=480,          # Resolución moderada
+            height=832, 
+            num_inference_steps=20, 
+            guidance_scale=7.0
+        ).frames[0]
+        
+        export_to_video(output, filepath, fps=8)
+        
+        # Limpieza intensiva
+        del pipe
+        torch.cuda.empty_cache()
+        gc.collect()
+        
+        return "OK"
+    except Exception as e:
+        import traceback
+        print(f"❌ WAN video error: {traceback.format_exc()}")
+        return str(e)
+
 async def generate_video_clip(prompt: str, project_id: int, scene_num: int, duration_sec: int = 5) -> Optional[str]:
-    """Intenta Runway ML primero, luego Kling AI, luego fallback local."""
+    """Intenta Kinovi AI primero, luego Runway ML, luego Kling AI, luego WAN local, luego fallback imagen."""
+    
+    # Intento 0: Kinovi AI (Seedance-20)
+    if KINOVI_API_KEY:
+        _add_log(project_id, f"Video escena {scene_num}: probando Kinovi (Seedance-20)...")
+        url = await kinovi_generate_video(prompt, project_id, scene_num, duration_sec)
+        if url:
+            return url
+        _add_log(project_id, f"Video escena {scene_num}: Kinovi falló, probando Runway...")
+
     # Intento 1: Runway ML
     if RUNWAY_API_KEY:
         _add_log(project_id, f"Video escena {scene_num}: probando Runway {RUNWAY_MODEL}...")
@@ -464,15 +607,23 @@ async def generate_video_clip(prompt: str, project_id: int, scene_num: int, dura
             return url
         _add_log(project_id, f"Video escena {scene_num}: Kling falló, probando generador local...")
 
-    # Intento 3: Fallback Local Gratuito (imageio)
-    _add_log(project_id, f"Video escena {scene_num}: generando video local (fallback gratuito)...")
     filename = f"p{project_id}_scene{scene_num}_video.mp4"
     filepath = str(GENERATED_DIR / filename)
-    
-    # Generamos de la duración exacta solicitada
+
+    # Intento 3: Súper Generador Local (WAN 2.1)
+    _add_log(project_id, f"Video escena {scene_num}: iniciando modelo WAN local pesado...")
+    wan_res = await asyncio.to_thread(_wan_generate_video, prompt, filepath, duration_sec)
+    if wan_res == "OK":
+        _add_log(project_id, f"Video local WAN escena {scene_num}: OK ✅ ({filename})")
+        return f"/api/python/files/{filename}"
+    else:
+        _add_log(project_id, f"Video WAN falló, pasando a imagen estática...")
+
+    # Intento 4: Fallback Local Gratuito (Pollinations imagen estática)
+    _add_log(project_id, f"Video escena {scene_num}: generando video estático de seguridad...")
     res = await asyncio.to_thread(_create_local_video, prompt, filepath, duration_sec)
     if res == "OK":
-        _add_log(project_id, f"Video local escena {scene_num}: OK ✅ ({filename})")
+        _add_log(project_id, f"Video local estático escena {scene_num}: OK ✅ ({filename})")
         return f"/api/python/files/{filename}"
 
     _add_log(project_id, f"Video escena {scene_num} fallback error: {str(res)[:80]}")
@@ -594,11 +745,11 @@ async def run_pipeline(
         _complete_stage(project_id, "narration")
 
         # ── Etapa 5: Video (Runway ML → Kling fallback) ────────────────────
-        provider = "Runway ML" if RUNWAY_API_KEY else "Kling AI"
+        provider = "Kinovi AI" if KINOVI_API_KEY else ("Runway ML" if RUNWAY_API_KEY else "Kling AI")
         _set_stage(project_id, "video", 62, f"Generando clips de video con {provider}...")
 
         video_files = []
-        if RUNWAY_API_KEY or (KLING_API_KEY and KLING_API_SECRET):
+        if KINOVI_API_KEY or RUNWAY_API_KEY or (KLING_API_KEY and KLING_API_SECRET):
             for i, scene in enumerate(scenes):
                 _set_stage(
                     project_id, "video",
